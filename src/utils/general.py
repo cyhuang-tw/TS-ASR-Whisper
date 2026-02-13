@@ -16,7 +16,8 @@ logging.set_verbosity_debug()
 logger = logging.get_logger("transformers")
 
 
-def update_generation_config(model, training_args, decoding_args, predict_timestamps):
+def update_generation_config(model, training_args, decoding_args, predict_timestamps,
+                             sot_separator_token_id=None):
     """
     Update the generation kwargs of the model with the training and decoding args
     """
@@ -36,6 +37,9 @@ def update_generation_config(model, training_args, decoding_args, predict_timest
     for k, v in not_used_args.items():
         logger.warning(f"{k}={v} was not used in the generation config")
 
+    # Set directly via attribute assignment since GenerationConfig.update() rejects unknown keys
+    model.generation_config.sot_separator_token_id = sot_separator_token_id
+
 
 
 def remove_custom_attributes(cut):
@@ -46,7 +50,9 @@ def get_cut_recording_id(cut):
     return cut.recording_id if isinstance(cut, MonoCut) else cut.id
 
 def round_nearest(x, a):
-    return round(x / a) * a
+    d = Decimal(str(x))
+    step = Decimal(str(a))
+    return float((d / step).to_integral_value(rounding=decimal.ROUND_HALF_UP) * step)
 
 
 def create_lower_uppercase_mapping(tokenizer):

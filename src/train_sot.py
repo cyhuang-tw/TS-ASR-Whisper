@@ -194,7 +194,11 @@ class ModelTrainer:
         self._log_model_parameters()
         self._load_model_weights()
         update_generation_config(self.model, self.training_args, self.decoding_args,
-                                 predict_timestamps=self.data_args.use_timestamps)
+                                 predict_timestamps=self.data_args.use_timestamps,
+                                 sot_separator_token_id=(
+                                     self.model.config.speaker_token_id
+                                     if self.data_args.use_timestamps else None
+                                 ))
 
         # Create trainer
         collator = self._create_data_collator()

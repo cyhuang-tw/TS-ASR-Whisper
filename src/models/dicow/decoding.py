@@ -291,7 +291,7 @@ class CTCRescorerLogitsProcessor(LogitsProcessor):
         input_ids[:, 0] = self.blank_token_id
 
         # If there is last token in input_ids timestamp replicate last non-timestamp token which could be potentially even the first token
-        decoded_len = torch.logical_and(input_ids <= self.first_timestamp_token_id,
+        decoded_len = torch.logical_and(input_ids < self.first_timestamp_token_id,
                                         input_ids != self.blank_token_id).sum(dim=1)
         mask = torch.logical_and(input_ids[:, -1] >= self.first_timestamp_token_id,
                                  input_ids[:, -1] != self.blank_token_id)

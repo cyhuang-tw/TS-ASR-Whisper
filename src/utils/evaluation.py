@@ -149,6 +149,41 @@ def parse_string_to_objects(s):
     return objects
 
 
+def sot_to_annotation(sot_string, session_id):
+    """Convert an SOT hypothesis string into a pyannote Annotation.
+
+    Splits on '????' to get per-speaker blocks, assigns synthetic speaker labels
+    (spk_0, spk_1, ...), and extracts timed segments via parse_string_to_objects.
+    """
+    from pyannote.core import Annotation, Segment
+
+    annotation = Annotation(uri=session_id)
+    blocks = sot_string.split("????")
+    for spk_idx, block in enumerate(blocks):
+        speaker = f"spk_{spk_idx}"
+        segments = parse_string_to_objects(block)
+        for seg in segments:
+            annotation[Segment(seg["start"], seg["end"]), speaker] = speaker
+    return annotation
+
+
+def ref_units_to_annotation(ref_ts_units, session_id):
+    """Convert reference transcript units (with timestamps) into a pyannote Annotation.
+
+    Each unit has 'speaker' and 'text' fields; timestamps are extracted from the text
+    via parse_string_to_objects.
+    """
+    from pyannote.core import Annotation, Segment
+
+    annotation = Annotation(uri=session_id)
+    for unit in ref_ts_units:
+        speaker = unit["speaker"]
+        segments = parse_string_to_objects(unit["text"])
+        for seg in segments:
+            annotation[Segment(seg["start"], seg["end"]), speaker] = speaker
+    return annotation
+
+
 def process_session(session_preds, tokenizer, spk_id, cut: DataCut, break_to_characters=False, overflow_margin=5.0):
     session_preds[session_preds == -100] = tokenizer.pad_token_id
     transcript = tokenizer.decode(session_preds, decode_with_timestamps=True,
@@ -316,13 +351,13 @@ def compute_longform_metrics(pred, trainer, output_dir, text_norm, metrics_list=
 
 def process_session_sot(session_preds, tokenizer, text_norm, sot_split_token="????"):
     session_preds[session_preds == -100] = tokenizer.pad_token_id
-    transcript = tokenizer.decode(session_preds, decode_with_timestamps=False,
-                                  skip_special_tokens=True)
-    per_spk_transcripts = transcript.split(sot_split_token)
+    raw_transcript = tokenizer.decode(session_preds, decode_with_timestamps=True,
+                                      skip_special_tokens=True)
+    per_spk_transcripts = raw_transcript.split(sot_split_token)
     output = []
     for transcript in per_spk_transcripts:
         output.append(text_norm(truncate_at_repeating_ngram(transcript)))
-    return output
+    return output, raw_transcript
 
 def compute_sot_longform_metrics(pred, trainer, output_dir, text_norm, metrics_list=None, dataset=None,
                              save_visualizations=True):
@@ -337,6 +372,9 @@ def compute_sot_longform_metrics(pred, trainer, output_dir, text_norm, metrics_l
 
         refs = {}
         hyps = {}
+        sot_raw = {}
+        ref_sot_raw = {}
+        ref_ts_units_by_cut = {}
         # Iterate over the predictions and process them
         processed_sessions_ids = set()
         for index, session_preds in enumerate(pred.predictions):
@@ -348,25 +386,54 @@ def compute_sot_longform_metrics(pred, trainer, output_dir, text_norm, metrics_l
             if cut_id in processed_sessions_ids:
                 # In DDP setup sampler can return the same session multiple times
                 continue
-            session_out = process_session_sot(session_preds, trainer.processing_class, text_norm)
+            session_out, raw_transcript = process_session_sot(session_preds, trainer.processing_class, text_norm)
             ref_units = first_eval_set.get_transcript_units(references_cs[cut_id], use_timestamps=False)
             if "speaker" in first_eval_set.sot_strategy:
                 ref_units = first_eval_set.merge_speaker_units(ref_units)
             ref = [item['text'] for item in ref_units]
+
+            # Reference with timestamps for SOT output
+            ref_ts_units = first_eval_set.get_transcript_units(references_cs[cut_id], use_timestamps=True)
+            if "speaker" in first_eval_set.sot_strategy:
+                ref_ts_units = first_eval_set.merge_speaker_units(ref_ts_units)
+            ref_sot_raw[cut_id] = "????".join(item['text'] for item in ref_ts_units)
+            ref_ts_units_by_cut[cut_id] = ref_ts_units
+
             if len(session_out) > 20 or len(session_out) > 2 * len(ref):
                 print(f"Produced too many speakers in {cut_id}: {session_out}\nClearing session output.")
                 session_out = []
             refs[cut_id] = ref
             hyps[cut_id] = session_out
+            sot_raw[cut_id] = raw_transcript
             processed_sessions_ids.add(cut_id)
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "hyp.json"), "w") as file:
             json.dump(hyps, file)
         with open(os.path.join(output_dir, "ref.json"), "w") as file:
             json.dump(refs, file)
+        with open(os.path.join(output_dir, "hyp_sot.json"), "w") as file:
+            json.dump(sot_raw, file)
+        with open(os.path.join(output_dir, "ref_sot.json"), "w") as file:
+            json.dump(ref_sot_raw, file)
         cp_wer = meeteval.wer.wer.cp_word_error_rate_multifile(reference=refs, hypothesis=hyps)
         with open(os.path.join(output_dir, "cp.wer"), "w") as file:
             json.dump(str(cp_wer), file)
         metrics = vars(meeteval.wer.combine_error_rates(cp_wer))
+
+        # Compute DER when timestamps are available
+        if first_eval_set.use_timestamps:
+            from pyannote.metrics.diarization import DiarizationErrorRate
+            der_metric = DiarizationErrorRate(collar=0.25)
+            for cut_id in sot_raw:
+                if cut_id not in ref_ts_units_by_cut:
+                    continue
+                hyp_annotation = sot_to_annotation(sot_raw[cut_id], cut_id)
+                ref_annotation = ref_units_to_annotation(ref_ts_units_by_cut[cut_id], cut_id)
+                der_metric(ref_annotation, hyp_annotation)
+            der_value = abs(der_metric)
+            metrics["der"] = der_value
+            with open(os.path.join(output_dir, "der.json"), "w") as file:
+                json.dump({"der": der_value}, file)
+
     metrics = broadcast_object_list([metrics], from_process=0)
     return metrics[0]

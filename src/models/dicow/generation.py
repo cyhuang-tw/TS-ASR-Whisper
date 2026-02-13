@@ -345,7 +345,7 @@ class DiCoWGenerationMixin(WhisperForConditionalGeneration):
         for idx, sequence_segs in enumerate(sequences['segments']):
             result = []
             prev_segment_end_time = None
-            correction = Decimal(0.0)
+            correction = Decimal('0')
 
             for i, seg in enumerate(sequence_segs):
                 # Round start and end times to nearest 0.02 seconds
@@ -379,22 +379,22 @@ class DiCoWGenerationMixin(WhisperForConditionalGeneration):
                     result.append(((start_time + correction) % 30, tokens, (end_time + correction) % 30))
                 elif (end_time + correction) % 30 == 0:
                     result.append(((start_time + correction) % 30, tokens, 30))
-                    correction = Decimal(0.0)
+                    correction = Decimal('0')
                 else:
                     # Segment would wrap across a 30s boundary
                     new_seg_start = (correction + start_time) % 30
                     seg_duration = end_time - start_time
                     new_end_time = (end_time + correction) % 30
                     # if segment duration is exactly 30s we have to use a correction trick, elsewise tokenizer will automatically adjust
-                    if seg_duration == 30.0:
+                    if seg_duration == Decimal('30'):
                         if float(new_seg_start) % 30.0 == 0.0:
-                            new_end_time = Decimal(30.0)
-                            correction = Decimal(0.0)
+                            new_end_time = Decimal('30')
+                            correction = Decimal('0')
                         else:
-                            correction = Decimal(-0.02)
-                            new_end_time += Decimal(correction)
+                            correction = Decimal('-0.02')
+                            new_end_time += correction
                     else:
-                        correction = Decimal(0.0)
+                        correction = Decimal('0')
                     result.append((new_seg_start, tokens, new_end_time))
                 # print(f'Processed segment {i}, result: {self.tokenizer.decode(self.tokenizer("".join([f"<|{seg[0]:.2f}|>{self.tokenizer.decode(seg[1])}<|{seg[2]:.2f}|>" for seg in result]))["input_ids"], decode_with_timestamps=True)[-250:]}')
                 # Update the previous segment's end time for next iteration
