@@ -51,6 +51,7 @@ class SOT_DatasetSuperclass:
         assert len(self.cutsets) == len(self.dataset_weights), "cutsets and dataset_weights must have the same length"
 
         self.cset = reduce(lambda a, b: a + b, self.cutsets)
+        self.prepare_cuts()
         self.max_timestamp_pause = max_timestamp_pause
         self.use_timestamps = use_timestamps
         self.text_norm = text_norm
@@ -62,6 +63,13 @@ class SOT_DatasetSuperclass:
         self.musan_augment_prob = musan_augment_prob
         if self.musan_augment_prob > 0.0:
             self.musan_augment = RandomBackgroundNoise(sample_rate=16_000, noise_dir=musan_root)
+
+    def prepare_cuts(self):
+        self.to_index_mapping = []
+        for cutset, weight in zip(self.cutsets, self.dataset_weights):
+            cut_weights = np.ones(len(cutset)) * weight
+            self.to_index_mapping.append(cut_weights)
+        self.to_index_mapping = np.cumsum(np.concatenate(self.to_index_mapping))
 
     @staticmethod
     def get_number_of_speakers_from_monocut(cut):
@@ -261,15 +269,16 @@ class SOT_Dataset(SOT_DatasetSuperclass, Dataset):
         SOT_DatasetSuperclass.__init__(self, *args, **kwargs)
 
     def __len__(self):
-        return len(self.cset)
+        return int(self.to_index_mapping[-1])
 
     def set_epoch(self, epoch):
         self._epoch = epoch
 
     def __getitem__(self, idx):
-        if idx > len(self):
-            raise 'Out of range'
-        cut = self.cset[idx]
+        if idx >= len(self):
+            raise IndexError('Out of range')
+        cut_index = np.searchsorted(self.to_index_mapping, idx, side='right')
+        cut = self.cset[cut_index]
         return self.cut_to_sample(cut)
 
 
