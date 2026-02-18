@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from collections import defaultdict
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Callable
@@ -123,7 +124,7 @@ def write_hypothesis_jsons(out_dir, session_id: str,
     }
 
 
-def parse_string_to_objects(s):
+def parse_string_to_objects(s, duration=None):
     # Regular expression to match the time tokens
     time_pattern = re.compile(r'<\|([\d.]+)\|>')
 
@@ -146,10 +147,23 @@ def parse_string_to_objects(s):
                 'text': text
             })
 
+    # Handle trailing text after the last timestamp (no closing timestamp)
+    if times and duration is not None:
+        last_idx = len(times) - 1
+        trailing_text_idx = 2 * last_idx + 1
+        if trailing_text_idx < len(text_segments):
+            trailing_text = text_segments[trailing_text_idx].strip()
+            if trailing_text:
+                objects.append({
+                    'start': float(times[last_idx]),
+                    'end': duration,
+                    'text': trailing_text
+                })
+
     return objects
 
 
-def sot_to_annotation(sot_string, session_id):
+def sot_to_annotation(sot_string, session_id, duration=None):
     """Convert an SOT hypothesis string into a pyannote Annotation.
 
     Splits on '????' to get per-speaker blocks, assigns synthetic speaker labels
@@ -161,7 +175,7 @@ def sot_to_annotation(sot_string, session_id):
     blocks = sot_string.split("????")
     for spk_idx, block in enumerate(blocks):
         speaker = f"spk_{spk_idx}"
-        segments = parse_string_to_objects(block)
+        segments = parse_string_to_objects(block, duration=duration)
         for seg in segments:
             annotation[Segment(seg["start"], seg["end"]), speaker] = speaker
     return annotation
@@ -181,6 +195,20 @@ def ref_units_to_annotation(ref_ts_units, session_id):
         segments = parse_string_to_objects(unit["text"])
         for seg in segments:
             annotation[Segment(seg["start"], seg["end"]), speaker] = speaker
+    return annotation
+
+
+def ref_cut_to_annotation(cut, session_id):
+    """Build reference pyannote Annotation directly from lhotse supervision objects.
+
+    This bypasses the text serialization roundtrip, avoiding silent drops of
+    segments whose last timestamp has no closing pair.
+    """
+    from pyannote.core import Annotation, Segment
+    annotation = Annotation(uri=session_id)
+    for sup in cut.supervisions:
+        if sup.duration > 0:
+            annotation[Segment(sup.start, sup.start + sup.duration), sup.speaker] = sup.speaker
     return annotation
 
 
@@ -349,14 +377,35 @@ def compute_longform_metrics(pred, trainer, output_dir, text_norm, metrics_list=
 #
 #     return output
 
-def process_session_sot(session_preds, tokenizer, text_norm, sot_split_token="????"):
+def process_session_sot(session_preds, tokenizer, text_norm,
+                        sot_split_token="????", sot_split_token_id=25629):
     session_preds[session_preds == -100] = tokenizer.pad_token_id
-    raw_transcript = tokenizer.decode(session_preds, decode_with_timestamps=True,
-                                      skip_special_tokens=True)
-    per_spk_transcripts = raw_transcript.split(sot_split_token)
+
+    # Split token IDs by separator BEFORE decoding each speaker block.
+    # This avoids the Whisper tokenizer's decode_with_timestamps adding
+    # spurious 30s offsets when timestamps restart (go backwards) after
+    # a speaker change.
+    blocks = []
+    current = []
+    for tok_id in session_preds.tolist():
+        tok_id = int(tok_id)
+        if tok_id == sot_split_token_id:
+            blocks.append(current)
+            current = []
+        elif tok_id != tokenizer.pad_token_id:
+            current.append(tok_id)
+    if current:
+        blocks.append(current)
+
     output = []
-    for transcript in per_spk_transcripts:
-        output.append(text_norm(truncate_at_repeating_ngram(transcript)))
+    raw_parts = []
+    for block_ids in blocks:
+        decoded = tokenizer.decode(block_ids, decode_with_timestamps=True,
+                                   skip_special_tokens=True)
+        raw_parts.append(decoded)
+        output.append(text_norm(truncate_at_repeating_ngram(decoded)))
+
+    raw_transcript = sot_split_token.join(raw_parts)
     return output, raw_transcript
 
 def compute_sot_longform_metrics(pred, trainer, output_dir, text_norm, metrics_list=None, dataset=None,
@@ -418,22 +467,113 @@ def compute_sot_longform_metrics(pred, trainer, output_dir, text_norm, metrics_l
         cp_wer = meeteval.wer.wer.cp_word_error_rate_multifile(reference=refs, hypothesis=hyps)
         with open(os.path.join(output_dir, "cp.wer"), "w") as file:
             json.dump(str(cp_wer), file)
-        metrics = vars(meeteval.wer.combine_error_rates(cp_wer))
+        combined = meeteval.wer.combine_error_rates(cp_wer)
+        metrics = vars(combined)
+        with open(os.path.join(output_dir, "cpwer.json"), "w") as file:
+            json.dump({"cpwer": combined.error_rate, "errors": combined.errors,
+                       "length": combined.length, "insertions": combined.insertions,
+                       "deletions": combined.deletions, "substitutions": combined.substitutions}, file)
+
+        # Build speaker-count mapping
+        num_spks_by_cut = {}
+        for cut_id in refs:
+            cut = references_cs[cut_id]
+            num_spks_by_cut[cut_id] = len(set(s.speaker for s in cut.supervisions))
+
+        spk_groups = defaultdict(list)
+        for cut_id, n in num_spks_by_cut.items():
+            spk_groups[n].append(cut_id)
+
+        # Compute per-speaker-count cpWER
+        cpwer_by_nspk = {}
+        for n, cut_ids in sorted(spk_groups.items()):
+            group_refs = {cid: refs[cid] for cid in cut_ids}
+            group_hyps = {cid: hyps[cid] for cid in cut_ids}
+            group_cp = meeteval.wer.wer.cp_word_error_rate_multifile(
+                reference=group_refs, hypothesis=group_hyps
+            )
+            group_combined = meeteval.wer.combine_error_rates(group_cp)
+            cpwer_by_nspk[n] = {
+                "cpwer": group_combined.error_rate,
+                "errors": group_combined.errors,
+                "length": group_combined.length,
+                "insertions": group_combined.insertions,
+                "deletions": group_combined.deletions,
+                "substitutions": group_combined.substitutions,
+                "num_sessions": len(cut_ids),
+            }
+
+        metrics["cpwer_by_num_speakers"] = cpwer_by_nspk
+        with open(os.path.join(output_dir, "cpwer_by_num_speakers.json"), "w") as f:
+            json.dump(cpwer_by_nspk, f, indent=2)
+
+        _LOG.info("=== cpWER by number of speakers ===")
+        for n in sorted(cpwer_by_nspk):
+            _LOG.info(f"  {n} spk(s): cpWER={cpwer_by_nspk[n]['cpwer']:.4f}  (n={cpwer_by_nspk[n]['num_sessions']})")
+
+        # Speaker confusion matrix: predicted # speakers (rows) vs ground-truth # speakers (cols)
+        num_pred_spks_by_cut = {cut_id: len(hyps[cut_id]) for cut_id in hyps}
+        all_counts = sorted(set(num_spks_by_cut.values()) | set(num_pred_spks_by_cut.values()))
+
+        # Build raw count matrix
+        confusion_counts = {pred_n: {gt_n: 0 for gt_n in all_counts} for pred_n in all_counts}
+        for cut_id in hyps:
+            gt_n = num_spks_by_cut[cut_id]
+            pred_n = num_pred_spks_by_cut[cut_id]
+            confusion_counts[pred_n][gt_n] += 1
+
+        # Normalize each column (gt speaker count) to percentages
+        col_totals = {gt_n: sum(confusion_counts[pred_n][gt_n] for pred_n in all_counts) for gt_n in all_counts}
+        confusion_pct = {}
+        for pred_n in all_counts:
+            confusion_pct[pred_n] = {}
+            for gt_n in all_counts:
+                total = col_totals[gt_n]
+                confusion_pct[pred_n][gt_n] = round(100.0 * confusion_counts[pred_n][gt_n] / total, 1) if total > 0 else 0.0
+
+        metrics["speaker_confusion_matrix"] = {"counts": confusion_counts, "percent": confusion_pct}
+        with open(os.path.join(output_dir, "speaker_confusion_matrix.json"), "w") as f:
+            json.dump({"counts": confusion_counts, "percent": confusion_pct, "row": "predicted", "col": "ground_truth"}, f, indent=2)
+
+        # Log confusion matrix as a table
+        header = "pred\\gt " + "".join(f"{gt_n:>8}" for gt_n in all_counts)
+        _LOG.info("=== Speaker confusion matrix (%, col-normalized) ===")
+        _LOG.info(header)
+        for pred_n in all_counts:
+            row = f"  {pred_n:>5} " + "".join(f"{confusion_pct[pred_n][gt_n]:>7.1f}%" for gt_n in all_counts)
+            _LOG.info(row)
 
         # Compute DER when timestamps are available
         if first_eval_set.use_timestamps:
             from pyannote.metrics.diarization import DiarizationErrorRate
             der_metric = DiarizationErrorRate(collar=0.25)
+            der_metrics_by_nspk = {n: DiarizationErrorRate(collar=0.25) for n in spk_groups}
             for cut_id in sot_raw:
                 if cut_id not in ref_ts_units_by_cut:
                     continue
-                hyp_annotation = sot_to_annotation(sot_raw[cut_id], cut_id)
                 ref_annotation = ref_units_to_annotation(ref_ts_units_by_cut[cut_id], cut_id)
+                hyp_annotation = sot_to_annotation(sot_raw[cut_id], cut_id, duration=references_cs[cut_id].duration)
                 der_metric(ref_annotation, hyp_annotation)
+                n = num_spks_by_cut[cut_id]
+                der_metrics_by_nspk[n](ref_annotation, hyp_annotation)
             der_value = abs(der_metric)
             metrics["der"] = der_value
             with open(os.path.join(output_dir, "der.json"), "w") as file:
                 json.dump({"der": der_value}, file)
+
+            der_by_nspk = {}
+            for n in sorted(der_metrics_by_nspk):
+                der_by_nspk[n] = {
+                    "der": abs(der_metrics_by_nspk[n]),
+                    "num_sessions": len(spk_groups[n]),
+                }
+            metrics["der_by_num_speakers"] = der_by_nspk
+            with open(os.path.join(output_dir, "der_by_num_speakers.json"), "w") as f:
+                json.dump(der_by_nspk, f, indent=2)
+
+            _LOG.info("=== DER by number of speakers ===")
+            for n in sorted(der_by_nspk):
+                _LOG.info(f"  {n} spk(s): DER={der_by_nspk[n]['der']:.4f}  (n={der_by_nspk[n]['num_sessions']})")
 
     metrics = broadcast_object_list([metrics], from_process=0)
     return metrics[0]

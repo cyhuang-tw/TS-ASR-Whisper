@@ -29,7 +29,7 @@ class SOT_DatasetSuperclass:
                  sot_strategy,
                  text_norm=lambda x: x,
                  use_timestamps=False,
-                 max_timestamp_pause=0.0,
+                 max_timestamp_pause=2.0,
                  model_features_subsample_factor=2,
                  dataset_weights=None,
                  feature_extractor=None,

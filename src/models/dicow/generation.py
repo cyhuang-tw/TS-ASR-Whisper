@@ -86,24 +86,25 @@ class DiCoWGenerationMixin(WhisperForConditionalGeneration):
         max_frames_vad = max_frames // 2
         seek_num_frames = (max_frames_vad - seek_vad).clamp(max=num_frames_vad)
 
-        stno_masks = []
-        for i in range(cur_bsz):
-            prev_i = batch_idx_map[i]
-            segment_input_slice = kwargs["stno_mask"][prev_i: prev_i + 1, :,
-                                  seek_vad[prev_i]: seek_vad[prev_i] + seek_num_frames[prev_i]]
+        if "stno_mask" in kwargs:
+            stno_masks = []
+            for i in range(cur_bsz):
+                prev_i = batch_idx_map[i]
+                segment_input_slice = kwargs["stno_mask"][prev_i: prev_i + 1, :,
+                                      seek_vad[prev_i]: seek_vad[prev_i] + seek_num_frames[prev_i]]
 
-            if segment_input_slice.shape[-1] < num_frames_vad:
-                orig_len = segment_input_slice.shape[-1]
-                # pad to 1500 if necessary
-                segment_input_slice = torch.nn.functional.pad(
-                    segment_input_slice, pad=(0, num_frames_vad - orig_len)
-                )
-                # set corresponding padding tokens to 1 in vad mask representing silence
-                segment_input_slice[0, 0, orig_len:] = 1.0
+                if segment_input_slice.shape[-1] < num_frames_vad:
+                    orig_len = segment_input_slice.shape[-1]
+                    # pad to 1500 if necessary
+                    segment_input_slice = torch.nn.functional.pad(
+                        segment_input_slice, pad=(0, num_frames_vad - orig_len)
+                    )
+                    # set corresponding padding tokens to 1 in vad mask representing silence
+                    segment_input_slice[0, 0, orig_len:] = 1.0
 
-            stno_masks.append(segment_input_slice)
-        kwargs["stno_mask"] = torch.cat(stno_masks, dim=0)
-        self.stno_mask_seek = kwargs["stno_mask"]
+                stno_masks.append(segment_input_slice)
+            kwargs["stno_mask"] = torch.cat(stno_masks, dim=0)
+            self.stno_mask_seek = kwargs["stno_mask"]
 
         if self.config.use_enrollments and "enrollments" in kwargs:
             for key in kwargs["enrollments"]:
@@ -556,7 +557,16 @@ class DiCoWGenerationMixin(WhisperForConditionalGeneration):
         if "stno_mask" in kwargs:
             self.stno_mask = kwargs["stno_mask"]
 
-        output = super().generate(**kwargs, return_segments=True)
+        sot_sep = getattr(self.generation_config, 'sot_separator_token_id', None)
+        if sot_sep is not None:
+            # SOT mode: skip return_segments because the long-form pipeline's
+            # _retrieve_segment() and _fix_timestamps_from_segmentation() are
+            # incompatible with multi-speaker output (separator token breaks
+            # consecutive-timestamp-pair detection, and timestamps restart per
+            # speaker).  SOT inputs are ≤30s so seeking is unnecessary.
+            output = super().generate(**kwargs)
+        else:
+            output = super().generate(**kwargs, return_segments=True)
 
         self.encoder_logits = None
 

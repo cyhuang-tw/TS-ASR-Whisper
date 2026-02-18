@@ -16,5 +16,7 @@ def get_text_norm(t_norm: str):
         return EnglishTextNormalizer(SPELLING_CORRECTIONS)
     elif t_norm == 'whisper_nsf':
         return EnglishTextNormalizerNSF()
+    elif t_norm == 'whisper_nsf_keep_fillers':
+        return EnglishTextNormalizerNSF(remove_fillers=False)
     else:
         return lambda x: x

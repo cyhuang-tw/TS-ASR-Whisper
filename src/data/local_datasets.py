@@ -120,7 +120,7 @@ class TS_ASR_DatasetSuperclass:
         if skip_end_token:
             end = ""
         if use_timestamps:
-            text = start + text + end
+            text = start + " " + text + end
         return text
 
     def merge_supervisions(self, target_spk_supervision):

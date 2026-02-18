@@ -103,7 +103,7 @@ class DiCoW(WhisperModel):
         )
 
 
-class DiCoWForConditionalGeneration(WhisperForConditionalGeneration):
+class DiCoWForConditionalGeneration(DiCoWGenerationMixin):
     config_class = DiCoWConfig
 
     def __init__(self, config: DiCoWConfig):
